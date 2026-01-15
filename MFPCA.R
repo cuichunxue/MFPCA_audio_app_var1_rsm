@@ -1,19 +1,18 @@
 ############################################################
-# ダミーデータ生成 ＋ FPCA（一変量FPCA）＋重回帰分析
+# ダミーデータ生成 ＋ FPCA（関数型主成分分析）＋重回帰分析
 # ＋ 目標波形への因子条件探索
 # 条件ごとに一次元の時系列データに対する「因子の寄与」を可視化し、
 # 目標波形に近づくための因子条件を最適化する
+# fdaパッケージを使用した実装
 ############################################################
 
 ## 必要パッケージ -----------------------------------------
-# install.packages("funData")
-# install.packages("MFPCA")
+# install.packages("fda")
 # install.packages("ggplot2")
 # install.packages("dplyr")
 # install.packages("tidyr")
 
-library(funData)
-library(MFPCA)
+library(fda)       # 関数型データ分析
 library(ggplot2)
 library(dplyr)
 library(tidyr)
@@ -76,55 +75,101 @@ for (i in 1:N_cond) {
 }
 
 ############################################################
-# 2. funData へ変換
-#    条件ごとに一次元の関数データオブジェクトを作成
+# 2. fdaパッケージで関数データオブジェクトを作成
+#    B-spline基底を使ってデータをスムージング
 ############################################################
 
-# funData を作成（一次元の関数データ）
-func_data <- funData(
-  argvals = time_grid,
-  X       = Y_matrix  # N_cond 行 × n_time 列
-)
+# B-spline基底の作成（データの滑らかさを制御）
+# nbasis: 基底関数の数（時間点数より少し多めが推奨）
+# norder: スプラインの次数（4 = 3次スプライン = キュービックスプライン）
+nbasis <- 25  # 基底関数の数
+norder <- 4   # スプラインの次数
+basis <- create.bspline.basis(rangeval = c(0, 1), nbasis = nbasis, norder = norder)
 
-# 確認
-cat("\n一次元関数データ構造:\n")
-print(func_data)
+cat("\nB-spline基底情報:\n")
+cat(sprintf("  基底関数数: %d\n", nbasis))
+cat(sprintf("  スプライン次数: %d\n", norder))
+cat(sprintf("  時間範囲: [%.1f, %.1f]\n", 0, 1))
 
-# 例：1つ目の条件の波形を確認（コメントアウト解除で使用）
-# plot(func_data, obs = 1)
+# データを関数データオブジェクト（fd）に変換
+# スムージングパラメータλを自動選択（GCV: Generalized Cross-Validation）
+cat("\nデータのスムージング実行中（GCVによる最適化）...\n")
+
+# Y_matrixを転置（fdaパッケージは列が観測、行が時間点を期待）
+Y_t <- t(Y_matrix)
+
+# スムージングパラメータの候補（10^-6から10^2まで）
+lambda_candidates <- 10^seq(-6, 2, by = 0.5)
+
+# GCVによる最適λの選択
+gcv_values <- numeric(length(lambda_candidates))
+for (i in seq_along(lambda_candidates)) {
+  fdPar_temp <- fdPar(basis, Lfdobj = 2, lambda = lambda_candidates[i])
+  smooth_temp <- smooth.basis(time_grid, Y_t, fdPar_temp)
+  gcv_values[i] <- mean(smooth_temp$gcv)
+}
+
+# 最適λを選択
+optimal_idx <- which.min(gcv_values)
+optimal_lambda <- lambda_candidates[optimal_idx]
+
+cat(sprintf("最適スムージングパラメータ λ = %.2e (GCV = %.6f)\n",
+            optimal_lambda, gcv_values[optimal_idx]))
+
+# 最適λでスムージング
+fdPar_obj <- fdPar(basis, Lfdobj = 2, lambda = optimal_lambda)
+smooth_result <- smooth.basis(time_grid, Y_t, fdPar_obj)
+func_data <- smooth_result$fd
+
+cat(sprintf("スムージング済み関数データ: %d 条件, %d 基底関数\n",
+            func_data$coefs %>% ncol(), nbasis))
 
 ############################################################
-# 3. FPCA（一変量FPCA）を実行
-#    - 主成分数 M = 4（必要に応じて増やす）
+# 3. FPCA（関数型主成分分析）を実行
+#    - fdaパッケージのpca.fd()を使用
 ############################################################
 
 M <- 4  # 取り出す主成分の数
 
 cat("\nFPCA実行中...\n")
-fpca_res <- UFPCA(
-  type = "uFPCA",
-  funDataObject = func_data,
-  npc = M
-)
+fpca_res <- pca.fd(func_data, nharm = M, centerfns = TRUE)
 
 # 結果の概要
 cat("\nFPCA結果サマリー:\n")
-print(summary(fpca_res))
+cat(sprintf("  主成分数: %d\n", M))
+cat(sprintf("  平均関数の基底数: %d\n", fpca_res$meanfd$basis$nbasis))
 
-# 主成分の寄与率を表示
-cat("\n累積寄与率:\n")
-print(cumsum(fpca_res$values) / sum(fpca_res$values))
+# 固有値と分散説明率
+eigenvalues <- fpca_res$values
+variance_explained <- eigenvalues / sum(eigenvalues)
+cumulative_variance <- cumsum(variance_explained)
 
-# 主成分関数を可視化（コメントアウト解除で使用）
-# plot(fpca_res)
-# screeplot(fpca_res)
+cat("\n固有値:\n")
+print(eigenvalues[1:M])
 
-# 各条件ごとの FPCA スコア（N_cond x M）
+cat("\n分散説明率:\n")
+for (i in 1:M) {
+  cat(sprintf("  PC%d: %.2f%% (累積: %.2f%%)\n",
+              i, variance_explained[i] * 100, cumulative_variance[i] * 100))
+}
+
+# 主成分スコア（N_cond x M）
 scores <- fpca_res$scores
 colnames(scores) <- paste0("PC", 1:M)
 
 cat("\nFPCAスコア（先頭6行）:\n")
 print(head(scores))
+
+# スムージングの効果を確認（コメントアウト解除で使用）
+# par(mfrow = c(2, 2))
+# for (i in 1:4) {
+#   plot(time_grid, Y_matrix[i, ], type = "p", pch = 20, col = "gray",
+#        main = paste("条件", i), xlab = "時間", ylab = "振幅")
+#   lines(func_data[i], col = "blue", lwd = 2)
+#   legend("topright", legend = c("観測値", "スムージング"),
+#          col = c("gray", "blue"), pch = c(20, NA), lty = c(NA, 1), lwd = c(NA, 2))
+# }
+# par(mfrow = c(1, 1))
 
 ############################################################
 # 4. FPCA スコアを目的変数とした重回帰分析
@@ -279,13 +324,12 @@ print(p_profile)
 # 6. 追加の詳細分析
 ############################################################
 
-# 各主成分の寄与率
+# 各主成分の寄与率（既に上で計算済み）
 cat("\n各主成分の説明する分散の割合:\n")
-variance_explained <- fpca_res$values / sum(fpca_res$values)
 variance_df <- data.frame(
   PC = paste0("PC", 1:M),
-  Variance_Explained = variance_explained,
-  Cumulative = cumsum(variance_explained)
+  Variance_Explained = variance_explained[1:M],
+  Cumulative = cumulative_variance[1:M]
 )
 print(variance_df)
 
@@ -348,15 +392,19 @@ print(factors[target_cond_id, ])
 
 ## 8.2 目標波形のFPCAスコア算出 ----------------------
 
-# 目標波形をfunData形式に変換
-target_func_data <- funData(
-  argvals = time_grid,
-  X = matrix(target_wave, nrow = 1)  # 1行の行列として
-)
+# 目標波形をfdオブジェクトに変換（同じ基底とスムージングパラメータを使用）
+target_smooth <- smooth.basis(time_grid, target_wave, fdPar_obj)
+target_fd <- target_smooth$fd
 
-# FPCAモデルを使って目標波形のスコアを計算
-# （既存のFPCA固有関数への射影）
-target_scores <- predict(fpca_res, newdata = target_func_data, scores = TRUE)
+# FPCAスコアを計算（既存の主成分への射影）
+# 目標波形を中心化
+target_centered <- target_fd - fpca_res$meanfd
+
+# 各主成分との内積を計算してスコアを求める
+target_scores <- numeric(M)
+for (k in 1:M) {
+  target_scores[k] <- inprod(target_centered, fpca_res$harmonics[k])
+}
 
 cat("\n目標波形のFPCAスコア:\n")
 print(target_scores)

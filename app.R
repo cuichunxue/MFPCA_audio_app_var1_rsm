@@ -7,8 +7,7 @@
 
 library(shiny)
 library(shinydashboard)
-library(funData)
-library(MFPCA)
+library(fda)       # 関数型データ分析
 library(ggplot2)
 library(dplyr)
 library(tidyr)
@@ -65,12 +64,30 @@ for (i in 1:N_cond) {
   Y_matrix[i, ] <- signal_i + noise_i
 }
 
-# funData変換
-func_data <- funData(argvals = time_grid, X = Y_matrix)
+# fdaパッケージでスムージングとFPCA
+nbasis <- 25
+norder <- 4
+basis <- create.bspline.basis(rangeval = c(0, 1), nbasis = nbasis, norder = norder)
+
+# GCVによる最適スムージングパラメータの選択
+Y_t <- t(Y_matrix)
+lambda_candidates <- 10^seq(-6, 2, by = 0.5)
+gcv_values <- numeric(length(lambda_candidates))
+for (i in seq_along(lambda_candidates)) {
+  fdPar_temp <- fdPar(basis, Lfdobj = 2, lambda = lambda_candidates[i])
+  smooth_temp <- smooth.basis(time_grid, Y_t, fdPar_temp)
+  gcv_values[i] <- mean(smooth_temp$gcv)
+}
+optimal_lambda <- lambda_candidates[which.min(gcv_values)]
+
+# 最適λでスムージング
+fdPar_obj <- fdPar(basis, Lfdobj = 2, lambda = optimal_lambda)
+smooth_result <- smooth.basis(time_grid, Y_t, fdPar_obj)
+func_data <- smooth_result$fd
 
 # FPCA実行
 M <- 4
-fpca_res <- UFPCA(type = "uFPCA", funDataObject = func_data, npc = M)
+fpca_res <- pca.fd(func_data, nharm = M, centerfns = TRUE)
 
 # PCスコア
 all_pc_scores <- fpca_res$scores
@@ -102,7 +119,8 @@ coef_df <- bind_rows(coef_list) %>%
   mutate(PC = gsub("z_", "", PC), Factor = gsub("z_", "", Factor))
 
 # 分散説明率
-variance_explained <- fpca_res$values / sum(fpca_res$values)
+eigenvalues <- fpca_res$values[1:M]
+variance_explained <- eigenvalues / sum(eigenvalues)
 variance_df <- data.frame(
   PC = paste0("PC", 1:M),
   Variance_Explained = variance_explained,
@@ -212,15 +230,21 @@ generate_waveform <- function(F1, F2, F3) {
 
 # 波形からPCスコアを計算（最適化で使用）
 calculate_pc_scores <- function(wave) {
-  target_func_data <- funData(
-    argvals = time_grid,
-    X = matrix(wave, nrow = 1)
-  )
-  # predict()を使ってFPCAスコアを計算
-  target_scores <- predict(fpca_res, newdata = target_func_data)
-  # 結果が行列であることを確認し、ベクトルに変換
-  target_scores <- as.matrix(target_scores)
-  return(as.vector(target_scores))
+  # 波形をfdオブジェクトに変換（同じ基底とスムージングパラメータを使用）
+  target_smooth <- smooth.basis(time_grid, wave, fdPar_obj)
+  target_fd <- target_smooth$fd
+
+  # FPCAスコアを計算（既存の主成分への射影）
+  # 目標波形を中心化
+  target_centered <- target_fd - fpca_res$meanfd
+
+  # 各主成分との内積を計算してスコアを求める
+  target_scores <- numeric(M)
+  for (k in 1:M) {
+    target_scores[k] <- inprod(target_centered, fpca_res$harmonics[k])
+  }
+
+  return(target_scores)
 }
 
 # 差異メトリクス計算
